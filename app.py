@@ -77,7 +77,7 @@ def main():
             api_name=False
         )
 
-        demo.queue().launch(share=False)
+        demo.queue().launch(share=True)
 
 
 if __name__ == "__main__":
