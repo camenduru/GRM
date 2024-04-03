@@ -14,8 +14,6 @@ from diff_gaussian_rasterization import (
 )
 from plyfile import PlyData, PlyElement
 from scipy.spatial.transform import Rotation as R
-import cv2
-import matplotlib
 
 
 def strip_lowerdiag(L):
@@ -70,133 +68,6 @@ def build_scaling_rotation(s, r):
 
     L = R @ L
     return L
-
-
-# copied from: utils.sh_utils
-C0 = 0.28209479177387814
-C1 = 0.4886025119029199
-C2 = [
-    1.0925484305920792,
-    -1.0925484305920792,
-    0.31539156525252005,
-    -1.0925484305920792,
-    0.5462742152960396,
-]
-C3 = [
-    -0.5900435899266435,
-    2.890611442640554,
-    -0.4570457994644658,
-    0.3731763325901154,
-    -0.4570457994644658,
-    1.445305721320277,
-    -0.5900435899266435,
-]
-C4 = [
-    2.5033429417967046,
-    -1.7701307697799304,
-    0.9461746957575601,
-    -0.6690465435572892,
-    0.10578554691520431,
-    -0.6690465435572892,
-    0.47308734787878004,
-    -1.7701307697799304,
-    0.6258357354491761,
-]
-
-
-def eval_sh(deg, sh, dirs):
-    """
-    Evaluate spherical harmonics at unit directions
-    using hardcoded SH polynomials.
-    Works with torch/np/jnp.
-    ... Can be 0 or more batch dimensions.
-    Args:
-        deg: int SH deg. Currently, 0-3 supported
-        sh: jnp.ndarray SH coeffs [..., C, (deg + 1) ** 2]
-        dirs: jnp.ndarray unit directions [..., 3]
-    Returns:
-        [..., C]
-    """
-    assert deg <= 4 and deg >= 0
-    coeff = (deg + 1) ** 2
-    assert sh.shape[-1] >= coeff
-
-    result = C0 * sh[..., 0]
-    if deg > 0:
-        x, y, z = dirs[..., 0:1], dirs[..., 1:2], dirs[..., 2:3]
-        result = (
-            result - C1 * y * sh[..., 1] + C1 * z * sh[..., 2] - C1 * x * sh[..., 3]
-        )
-
-        if deg > 1:
-            xx, yy, zz = x * x, y * y, z * z
-            xy, yz, xz = x * y, y * z, x * z
-            result = (
-                result
-                + C2[0] * xy * sh[..., 4]
-                + C2[1] * yz * sh[..., 5]
-                + C2[2] * (2.0 * zz - xx - yy) * sh[..., 6]
-                + C2[3] * xz * sh[..., 7]
-                + C2[4] * (xx - yy) * sh[..., 8]
-            )
-
-            if deg > 2:
-                result = (
-                    result
-                    + C3[0] * y * (3 * xx - yy) * sh[..., 9]
-                    + C3[1] * xy * z * sh[..., 10]
-                    + C3[2] * y * (4 * zz - xx - yy) * sh[..., 11]
-                    + C3[3] * z * (2 * zz - 3 * xx - 3 * yy) * sh[..., 12]
-                    + C3[4] * x * (4 * zz - xx - yy) * sh[..., 13]
-                    + C3[5] * z * (xx - yy) * sh[..., 14]
-                    + C3[6] * x * (xx - 3 * yy) * sh[..., 15]
-                )
-
-                if deg > 3:
-                    result = (
-                        result
-                        + C4[0] * xy * (xx - yy) * sh[..., 16]
-                        + C4[1] * yz * (3 * xx - yy) * sh[..., 17]
-                        + C4[2] * xy * (7 * zz - 1) * sh[..., 18]
-                        + C4[3] * yz * (7 * zz - 3) * sh[..., 19]
-                        + C4[4] * (zz * (35 * zz - 30) + 3) * sh[..., 20]
-                        + C4[5] * xz * (7 * zz - 3) * sh[..., 21]
-                        + C4[6] * (xx - yy) * (7 * zz - 1) * sh[..., 22]
-                        + C4[7] * xz * (xx - 3 * yy) * sh[..., 23]
-                        + C4[8]
-                        * (xx * (xx - 3 * yy) - yy * (3 * xx - yy))
-                        * sh[..., 24]
-                    )
-    return result
-
-
-def RGB2SH(rgb):
-    return (rgb - 0.5) / C0
-
-
-def SH2RGB(sh):
-    return sh * C0 + 0.5
-
-
-def create_video(image_folder, output_video_file, framerate=30):
-    # Get all image file paths to a list.
-    images = [img for img in os.listdir(image_folder) if img.endswith(".png")]
-    images.sort()
-
-    # Read the first image to know the height and width
-    frame = cv2.imread(os.path.join(image_folder, images[0]))
-    height, width, layers = frame.shape
-
-    video = cv2.VideoWriter(
-        output_video_file, cv2.VideoWriter_fourcc(*"mp4v"), framerate, (width, height)
-    )
-
-    # iterate over each image and add it to the video sequence
-    for image in images:
-        video.write(cv2.imread(os.path.join(image_folder, image)))
-
-    cv2.destroyAllWindows()
-    video.release()
 
 
 class Camera(nn.Module):
@@ -353,85 +224,23 @@ class GaussianModel:
             self.get_scaling, scaling_modifier, self._rotation
         )
 
-    def construct_dtypes(self, use_fp16=False, enable_gs_viewer=True):
-        if not use_fp16:
-            l = [
-                ("x", "f4"),
-                ("y", "f4"),
-                ("z", "f4"),
-                ("red", "u1"),
-                ("green", "u1"),
-                ("blue", "u1"),
-            ]
-            # All channels except the 3 DC
-            if self.sh_degree > 0:
-                for i in range(self._features_dc.shape[1] * self._features_dc.shape[2]):
-                    l.append((f"f_dc_{i}", "f4"))
-            else:
-                for i in range(self._features_dc.shape[1]):
-                    l.append((f"f_dc_{i}", "f4"))
-
-            if enable_gs_viewer:
-                assert self.sh_degree <= 3, "GS viewer only supports SH up to degree 3"
-                if self.sh_degree > 0:
-                    sh_degree = 3
-                    for i in range(((sh_degree + 1) ** 2 - 1) * 3):
-                        l.append((f"f_rest_{i}", "f4"))
-            else:
-                if self.sh_degree > 0:
-                    for i in range(
-                        self._features_rest.shape[1] * self._features_rest.shape[2]
-                    ):
-                        l.append((f"f_rest_{i}", "f4"))
-
-            l.append(("opacity", "f4"))
-            for i in range(self._scaling.shape[1]):
-                l.append((f"scale_{i}", "f4"))
-            for i in range(self._rotation.shape[1]):
-                l.append((f"rot_{i}", "f4"))
-        else:
-            l = [
-                ("x", "f2"),
-                ("y", "f2"),
-                ("z", "f2"),
-                ("red", "u1"),
-                ("green", "u1"),
-                ("blue", "u1"),
-            ]
-            # All channels except the 3 DC
-            for i in range(self._features_dc.shape[1] * self._features_dc.shape[2]):
-                l.append((f"f_dc_{i}", "f2"))
-
-            if self.sh_degree > 0:
-                for i in range(
-                    self._features_rest.shape[1] * self._features_rest.shape[2]
-                ):
-                    l.append((f"f_rest_{i}", "f2"))
-            l.append(("opacity", "f2"))
-            for i in range(self._scaling.shape[1]):
-                l.append((f"scale_{i}", "f2"))
-            for i in range(self._rotation.shape[1]):
-                l.append((f"rot_{i}", "f2"))
+    def construct_list_of_attributes(self):
+        l = ['x', 'y', 'z']
+        # All channels except the 3 DC
+        for i in range(self._features_dc.shape[1]):
+            l.append('f_dc_{}'.format(i))
+        l.append('opacity')
+        for i in range(self._scaling.shape[1]):
+            l.append('scale_{}'.format(i))
+        for i in range(self._rotation.shape[1]):
+            l.append('rot_{}'.format(i))
         return l
 
     def save_ply_vis(self, path):
-        flip_yz_rot_mat = np.array(
-            [[1, 0, 0],
-             [0, 0, -1],
-             [0, 1, 0]]
-        )
-
         xyzs = self._xyz.detach().cpu().numpy()
-        xyzs = xyzs @ flip_yz_rot_mat.T
-
-        f_dc = (
-            self._features_dc.detach()
-            .contiguous()
-            .cpu()
-            .numpy()
-        )
-
+        f_dc = self._features_dc.detach().contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
+
         if self.scaling_activation_type == 'exp':
             scale = self._scaling
         elif self.scaling_activation_type == 'softplus':
@@ -441,46 +250,26 @@ class GaussianModel:
             scale = torch.log(scale)
         scales = scale.detach().cpu().numpy()
 
-        rotations = self._rotation.detach().cpu().numpy()  # (N, 4) quarternion
-        # apply flip_yz_rot_mat
+        rot_mat_vis = np.array([[1, 0, 0],[0, 0, -1],[0, 1, 0]])
+        xyzs = xyzs @ rot_mat_vis.T
+        rotations = self._rotation.detach().cpu().numpy()
         rotations = R.from_quat(rotations[:, [1,2,3,0]]).as_matrix()
-        rotations = flip_yz_rot_mat @ rotations
+        rotations = rot_mat_vis @ rotations
         rotations = R.from_matrix(rotations).as_quat()[:, [3,0,1,2]]
 
-        l = ['x', 'y', 'z']
-        # All channels except the 3 DC
-        for i in range(f_dc.shape[1]):
-            l.append('f_dc_{}'.format(i))
-        l.append('opacity')
-        for i in range(scales.shape[1]):
-            l.append('scale_{}'.format(i))
-        for i in range(rotations.shape[1]):
-            l.append('rot_{}'.format(i))
-
-        dtype_full = [(attribute, 'f4') for attribute in l]
-
+        dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
         elements = np.empty(xyzs.shape[0], dtype=dtype_full)
         attributes = np.concatenate((xyzs, f_dc, opacities, scales, rotations), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
 
-    def save_ply(self, path, use_fp16=False, enable_gs_viewer=True, color_code=False):
+    def save_ply(self, path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
         xyz = self._xyz.detach().cpu().numpy()
-        if self.sh_degree > 0:
-            f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        else:
-            f_dc = self._features_dc.detach().contiguous().cpu().numpy()
-        if not color_code:
-            rgb = (SH2RGB(f_dc) * 255.0).clip(0.0, 255.0).astype(np.uint8)
-        else:
-            # use an color map to color code the index of points
-            index = np.linspace(0, 1, xyz.shape[0])
-            rgb = matplotlib.colormaps["viridis"](index)[..., :3]
-            rgb = (rgb * 255.0).clip(0.0, 255.0).astype(np.uint8)
-
+        f_dc = self._features_dc.detach().contiguous().cpu().numpy()
+        rgb = (f_dc * 255.0).clip(0.0, 255.0).astype(np.uint8)
         opacities = self._opacity.detach().cpu().numpy()
         if self.scaling_activation_type == 'exp':
             scale = self._scaling
@@ -490,41 +279,12 @@ class GaussianModel:
             scale = self.scale_min_act + (self.scale_max_act - self.scale_min_act) * self.scaling_activation(self._scaling)
             scale = torch.log(scale)
         scale = scale.detach().cpu().numpy()
-
         rotation = self._rotation.detach().cpu().numpy()
 
-        dtype_full = self.construct_dtypes(use_fp16, enable_gs_viewer)
+        dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
+        dtype_full.extend([("red", "u1"),("green", "u1"),("blue", "u1")])
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-
-        f_rest = None
-        if self.sh_degree > 0:
-            f_rest = (
-                self._features_rest.detach()
-                .transpose(1, 2)
-                .flatten(start_dim=1)
-                .contiguous()
-                .cpu()
-                .numpy()
-            ) 
-
-        if enable_gs_viewer:
-            if self.sh_degree > 0:
-                sh_degree = 3
-                if f_rest is None:
-                    f_rest = np.zeros((xyz.shape[0], 3*((sh_degree + 1) ** 2 - 1)), dtype=np.float32)
-                elif f_rest.shape[1] < 3*((sh_degree + 1) ** 2 - 1):
-                    f_rest_pad = np.zeros((xyz.shape[0], 3*((sh_degree + 1) ** 2 - 1)), dtype=np.float32)
-                    f_rest_pad[:, : f_rest.shape[1]] = f_rest
-                    f_rest = f_rest_pad
-
-        if f_rest is not None:
-            attributes = np.concatenate(
-                (xyz, rgb, f_dc, f_rest, opacities, scale, rotation), axis=1
-            )
-        else:
-            attributes = np.concatenate(
-                (xyz, rgb, f_dc, opacities, scale, rotation), axis=1
-            )
+        attributes = np.concatenate((xyz, f_dc, opacities, scale, rotation, rgb), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, "vertex")
         PlyData([el]).write(path)
@@ -532,14 +292,9 @@ class GaussianModel:
     def load_ply(self, path):
         plydata = PlyData.read(path)
 
-        xyz = np.stack(
-            (
-                np.asarray(plydata.elements[0]["x"]),
-                np.asarray(plydata.elements[0]["y"]),
-                np.asarray(plydata.elements[0]["z"]),
-            ),
-            axis=1,
-        )
+        xyz = np.stack((np.asarray(plydata.elements[0]["x"]),
+                        np.asarray(plydata.elements[0]["y"]),
+                        np.asarray(plydata.elements[0]["z"])),  axis=1)
         opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
 
         features_dc = np.zeros((xyz.shape[0], 3, 1))
@@ -547,54 +302,21 @@ class GaussianModel:
         features_dc[:, 1, 0] = np.asarray(plydata.elements[0]["f_dc_1"])
         features_dc[:, 2, 0] = np.asarray(plydata.elements[0]["f_dc_2"])
 
-        if self.sh_degree > 0:
-            extra_f_names = [
-                p.name
-                for p in plydata.elements[0].properties
-                if p.name.startswith("f_rest_")
-            ]
-            extra_f_names = sorted(extra_f_names, key=lambda x: int(x.split("_")[-1]))
-            assert len(extra_f_names) == 3 * (self.sh_degree + 1) ** 2 - 3
-            features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
-            for idx, attr_name in enumerate(extra_f_names):
-                features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
-            features_extra = features_extra.reshape(
-                (features_extra.shape[0], 3, (self.sh_degree + 1) ** 2 - 1)
-            )
-
-        scale_names = [
-            p.name
-            for p in plydata.elements[0].properties
-            if p.name.startswith("scale_")
-        ]
-        scale_names = sorted(scale_names, key=lambda x: int(x.split("_")[-1]))
+        scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
+        scale_names = sorted(scale_names, key = lambda x: int(x.split('_')[-1]))
         scales = np.zeros((xyz.shape[0], len(scale_names)))
         for idx, attr_name in enumerate(scale_names):
             scales[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
-        rot_names = [
-            p.name for p in plydata.elements[0].properties if p.name.startswith("rot")
-        ]
+        rot_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("rot")]
         rot_names = sorted(rot_names, key=lambda x: int(x.split("_")[-1]))
         rots = np.zeros((xyz.shape[0], len(rot_names)))
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
         self._xyz = torch.from_numpy(xyz.astype(np.float32))
-        self._features_dc = (
-            torch.from_numpy(features_dc.astype(np.float32))
-            .transpose(1, 2)
-            .contiguous()
-        )
-        if self.sh_degree > 0:
-            self._features_rest = (
-                torch.from_numpy(features_extra.astype(np.float32))
-                .transpose(1, 2)
-                .contiguous()
-            )
-        self._opacity = torch.from_numpy(
-            np.copy(opacities).astype(np.float32)
-        ).contiguous()
+        self._features_dc = torch.from_numpy(features_dc.astype(np.float32)).transpose(1, 2).contiguous()
+        self._opacity = torch.from_numpy(opacities.astype(np.float32)).contiguous()
         self._scaling = torch.from_numpy(scales.astype(np.float32)).contiguous()
         self._rotation = torch.from_numpy(rots.astype(np.float32)).contiguous()
 
@@ -650,7 +372,7 @@ def render(
     rotations = pc.get_rotation
     shs = pc.get_features
 
-    rendered_image, radii, rendered_depth, rendered_alpha = rasterizer(
+    rendered_image, _, rendered_depth, rendered_alpha = rasterizer(
         means3D=means3D,
         means2D=means2D,
         shs=None,

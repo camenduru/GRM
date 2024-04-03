@@ -5,7 +5,7 @@
 > **GRM: Large Gaussian Reconstruction Model for Efficient 3D Reconstruction and Generation** <br>
 > Yinghao Xu*, Zifan Shi*, Wang Yifan, Hansheng Chen, Ceyuan Yang, Sida Peng, Yujun Shen, Gordon Wetzstein<br>
 
-## [[Paper](https://arxiv.org/abs/2403.14621)] [[Project Page](https://justimyhxu.github.io/projects/grm)] [[Blender Demo](https://github.com/justimyhxu/GRM/assets/29980330/0cf713aa-ba87-4a15-a8ee-1b0da643cb3c)] [[HF Demo](https://huggingface.co/spaces/GRM-demo/GRM)]
+## [[Paper](https://arxiv.org/abs/2403.14621)] [[Project Page](https://justimyhxu.github.io/projects/grm)] [[Blender Demo](https://github.com/justimyhxu/GRM/assets/29980330/0cf713aa-ba87-4a15-a8ee-1b0da643cb3c)] [[HF Demo](https://huggingface.co/spaces/GRM-demo/GRM)][[Weights](https://huggingface.co/justimyhxu/GRM/tree/main)]
 
 https://github.com/justimyhxu/GRM/assets/29980330/32f41f04-5ebe-4aa4-b1b7-bf4f78e5f197
 
@@ -14,6 +14,10 @@ https://github.com/justimyhxu/GRM/assets/29980330/32f41f04-5ebe-4aa4-b1b7-bf4f78
 - [x] Release inference code.
 - [x] Release pretrained models.
 - [ ] Release training code.
+
+## GRM Demo
+* [Huggingface Demo](https://huggingface.co/spaces/GRM-demo/GRM)
+* [Replicate Demo](https://replicate.com/camenduru/grm). Thanks [@camenduru](https://github.com/camenduru) for the [jupyter code](https://github.com/camenduru/GRM-jupyter)! 
 
 ## Requirements
 * 64-bit Python 3.10 and PyTorch 2.0.1 or higher.
@@ -40,6 +44,7 @@ Note that we provide three checkpoints for use. We use the OpenCV coordinate sys
 | [grm_u.pth](https://huggingface.co/justimyhxu/GRM/blob/main/grm_u.pth)  | The elevations are all 20 degrees and the azimuths uniformly cover all the 360-degree information.|
 | [grm_r.pth](https://huggingface.co/justimyhxu/GRM/blob/main/grm_r.pth)  | The azimuths roughly cover the 360-degree information. |
 | [grm_zero123plus.pth](https://huggingface.co/justimyhxu/GRM/blob/main/grm_zero123plus.pth) | Three views are with 30-degree elevations and the azimuths are evenly distributed at intervals of 120 degrees. Another view has the elevation of -20 degrees and the azimuth is 60 degrees different from one of the three. |
+| [instant3d.pth](https://huggingface.co/justimyhxu/GRM/resolve/main/instant3d.pth) | We reproduce the first-stage diffusion model of [instant3d](https://arxiv.org/pdf/2311.06214.pdf), which can produce consistent multi-view images. |
 
 
 Besides, you need to download checkpoints for [SV3D](https://huggingface.co/stabilityai/sv3d/tree/main).
@@ -54,21 +59,21 @@ wget https://huggingface.co/stabilityai/sv3d/blob/main/sv3d_p.safetensors && cd 
 # text-to-3D
 python test.py --prompt 'a car made out of cheese'
 # image-to-3D with zero123plus-v1.1
-python test.py --image_path examples/image.png --model zero123plus-v1.1
+python test.py --image_path examples/dragon2.png --model zero123plus-v1.1
 # image-to-3D with zero123plus-v1.2
-python test.py --image_path examples/image.png --model zero123plus-v1.2
+python test.py --image_path examples/dragon2.png --model zero123plus-v1.2
 # image-to-3D with SV3D
-python test.py --image_path examples/image.png --model sv3d
+python test.py --image_path examples/dragon2.png --model sv3d
 ```
 
 Add ```--fuse_mesh True``` if you would like to get the textured mesh.
+Add ```--optimize_texture True``` if you would like to optimize texture on extracted textured mesh.
 
 ## Gradio Demo
 We provide an offline gradio demo, which can be run with the following command:
 ```bash
 python app.py
 ```
-![gradio](https://github.com/justimyhxu/GRM/assets/29980330/20941cd0-c163-4a47-8289-44eb112279e4)
 
 ## Results
 

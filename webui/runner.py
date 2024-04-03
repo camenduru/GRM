@@ -206,68 +206,61 @@ def save_gaussian(latent, gs_path, model, opacity_thr=None):
     vis_gs_path = gs_path[:-4] + '_vis' + gs_path[-4:] 
     pc.save_ply_vis(vis_gs_path)
 
+def rgbd_to_mesh(images, depths, c2ws, fov, mesh_path, cam_elev_thr=0):
 
-def fuse_rgbd_to_mesh(cam_dict, colors, depths, out_mesh_fpath, cam_elev_threshold=0):
-    """fuse rgbd into a textured mesh
+    voxel_length = 2 * 2.0 / 512.0
+    sdf_trunc = 2 * 0.02
+    color_type = o3d.pipelines.integration.TSDFVolumeColorType.RGB8
 
-    Args:
-        cam_dict (dict): opencv camera dictionary
-        colors (np.ndarray): [N, H, W, 3]; uint8
-        depths (np.ndarray): [N, H, W]; float32
-        out_mesh_fpath (string): path to obj file
-        cam_elev_threshold (float, optional): _description_. Defaults to 0.
-    """
     volume = o3d.pipelines.integration.ScalableTSDFVolume(
-        voxel_length=2 * 2.0 / 512.0,
-        sdf_trunc=2 * 0.02,
-        color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
+        voxel_length=voxel_length,
+        sdf_trunc=sdf_trunc,
+        color_type=color_type,
     )
 
-    print("Integrate images into the TSDF volume.")
-    for i in tqdm(range(len(cam_dict["frames"]))):
-        frame = cam_dict["frames"][i]
-
-        w2c = np.array(frame["w2c"])
-        c2w = np.linalg.inv(w2c)
-        cam_pos = c2w[:3, 3]
-        cam_elev = np.rad2deg(np.arcsin(cam_pos[2]))
-        if cam_elev < cam_elev_threshold:
-            # print(f"Camera {i} is below the threshold {cam_elev_threshold}. Skip.")
+    for i in tqdm(range(c2ws.shape[0])):
+        camera_to_world = c2ws[i]
+        world_to_camera = np.linalg.inv(camera_to_world)
+        camera_position = camera_to_world[:3, 3]
+        camera_elevation = np.rad2deg(np.arcsin(camera_position[2]))
+        if camera_elevation < cam_elev_thr:
             continue
-
-        color = o3d.geometry.Image(np.ascontiguousarray(colors[i]))
-        depth = o3d.geometry.Image(np.ascontiguousarray(depths[i]))
-        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-            color, depth, depth_scale=1.0, depth_trunc=4.0, convert_rgb_to_intensity=False
+        color_image = o3d.geometry.Image(np.ascontiguousarray(images[i]))
+        depth_image = o3d.geometry.Image(np.ascontiguousarray(depths[i]))
+        rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(
+            color_image, depth_image, depth_scale=1.0, depth_trunc=4.0, convert_rgb_to_intensity=False
         )
-        cam_intrinsics = o3d.camera.PinholeCameraIntrinsic()
-        cam_intrinsics.set_intrinsics(
-            frame["w"], frame["h"], frame["fx"], frame["fy"], frame["cx"], frame["cy"]
+        camera_intrinsics = o3d.camera.PinholeCameraIntrinsic()
+
+        fx = fy =  images[i].shape[1] / 2. / np.tan(np.deg2rad(fov / 2.0))
+        cx = cy = images[i].shape[1] / 2.
+        h =  images[i].shape[0]
+        w =  images[i].shape[1]
+        camera_intrinsics.set_intrinsics(
+            w, h, fx, fy, cx, cy
         )
         volume.integrate(
-            rgbd,
-            cam_intrinsics,
-            w2c,
+            rgbd_image,
+            camera_intrinsics,
+            world_to_camera,
         )
 
-    print("Extract a triangle mesh from the volume and export it.")
-    mesh = volume.extract_triangle_mesh()
+    fused_mesh = volume.extract_triangle_mesh()
 
-    with o3d.utility.VerbosityContextManager(
-            o3d.utility.VerbosityLevel.Debug) as cm:
-        triangle_clusters, cluster_n_triangles, cluster_area = (
-            mesh.cluster_connected_triangles())
+    triangle_clusters, cluster_n_triangles, cluster_area = (
+            fused_mesh.cluster_connected_triangles())
     triangle_clusters = np.asarray(triangle_clusters)
     cluster_n_triangles = np.asarray(cluster_n_triangles)
     cluster_area = np.asarray(cluster_area)
 
     triangles_to_remove = cluster_n_triangles[triangle_clusters] < 500
-    mesh.remove_triangles_by_mask(triangles_to_remove)
-    mesh.remove_unreferenced_vertices()
+    fused_mesh.remove_triangles_by_mask(triangles_to_remove)
+    fused_mesh.remove_unreferenced_vertices()
 
-    mesh = mesh.filter_smooth_simple(number_of_iterations=2)
-    mesh = mesh.compute_vertex_normals()
-    o3d.io.write_triangle_mesh(out_mesh_fpath, mesh)
+    fused_mesh = fused_mesh.filter_smooth_simple(number_of_iterations=2)
+    fused_mesh = fused_mesh.compute_vertex_normals()
+    o3d.io.write_triangle_mesh(mesh_path, fused_mesh)
+    print(f'Save mesh at {mesh_path}')
 
 
 def images2gaussian(images, c2ws, fxfycxcy, model, model_config, gs_path, video_path,
@@ -320,22 +313,9 @@ def images2gaussian(images, c2ws, fxfycxcy, model, model_config, gs_path, video_
                 mask = (weights_sum > 1e-2).astype(np.uint8)
                 depths = depths * mask - np.ones_like(depths) * (1 - mask)
 
-                cam_dict = {"frames": []}
-                hfov = 50
-
-                for j in range(images.shape[0]):
-                    frame_dict = {}
-                    fx = images[j].shape[1] / 2. / np.tan(np.deg2rad(hfov / 2.0))
-                    fy = fx
-                    frame_dict["fx"] = fx
-                    frame_dict["fy"] = fy
-                    frame_dict["cx"] = images[j].shape[1] / 2.
-                    frame_dict["cy"] = images[j].shape[0] / 2.
-                    frame_dict["h"] = images[j].shape[0]
-                    frame_dict["w"] = images[j].shape[1]
-                    frame_dict["w2c"] = np.linalg.inv(fib_camera_path[j].detach().cpu().numpy()).tolist()
-                    cam_dict["frames"].append(frame_dict)
-                fuse_rgbd_to_mesh(cam_dict, images, depths, mesh_path)
+                c2ws = fib_camera_path.detach().cpu().numpy()
+                fov = 50
+                rgbd_to_mesh(images, depths, c2ws, fov, mesh_path)
 
         if fuse_mesh:
             num_cameras = 16
@@ -392,7 +372,7 @@ def instant3d_gs(instant3d_model,
                  prompt='a chair',
                  guidance_scale=5.0,
                  num_steps=30,
-                 gaussian_sigma=0.1,
+                 gaussian_std=0.1,
                  fuse_mesh=False,
                  mesh_renderer=None,
                  cache_dir='cache'):
@@ -400,7 +380,7 @@ def instant3d_gs(instant3d_model,
                            prompt=prompt,
                            guidance_scale=guidance_scale,
                            num_steps=num_steps,
-                           gaussian_sigma=gaussian_sigma)
+                           gaussian_std=gaussian_std)
     torch.cuda.empty_cache()
 
     image_np = image.cpu().numpy().transpose(1, 2, 0)
@@ -808,7 +788,7 @@ class GRMRunner:
             prompt=prompt,
             guidance_scale=5.0,
             num_steps=30,
-            gaussian_sigma=0.1,
+            gaussian_std=0.1,
             mesh_renderer=self.mesh_renderer,
             fuse_mesh=fuse_mesh,
             cache_dir=output_dir)

@@ -585,7 +585,7 @@ class MeshRenderer(nn.Module):
         rast = rast.expand(n, -1, -1, -1)
         rast_db = rast_db.expand(n, -1, -1, -1)
         v_img = v_clip[..., :2] / v_clip[..., 3:] * 0.5 + 0.5
-        print(v_img.min(), v_img.max())
+        # print(v_img.min(), v_img.max())
         texc, texc_db = dr.interpolate(
             v_img.contiguous(), rast.contiguous(), mesh.f, rast_db=rast_db.contiguous(), diff_attrs='all')
         # (n, map_size, map_size, 4)

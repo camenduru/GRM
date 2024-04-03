@@ -20,8 +20,7 @@ from sgm.inference.helpers import embed_watermark
 from sgm.util import default, instantiate_from_config
 from torchvision.transforms import ToTensor
 
-def build_sv3d_model(version,
-                     num_steps,
+def build_sv3d_model(num_steps,
                      device,
                      verbose=False):
     num_frames = 21

@@ -8,20 +8,31 @@ import torch
 import imageio
 import math
 import cv2
+import fast_simplification
+import fpsample
 import open3d as o3d
 from tqdm import tqdm
 from utils import saveload_utils
 from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler
+from webui.base_mesh import Mesh
+from webui.base_mesh_renderer import MeshRenderer
 
 current_folder = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(f'{current_folder}/third_party/generative_models')
 
 from third_party.generative_models.instant3d import build_instant3d_model, instant3d_pipe
+from third_party.generative_models.scripts.sampling.simple_video_sample import build_sv3d_model
 from third_party.generative_models.scripts.sampling.simple_video_sample import sample as sv3d_pipe
 
 ### set gpu
 torch.cuda.set_device(0)
 device = torch.device(0)
+
+mesh_renderer = MeshRenderer(
+   near=0.01,
+   far=100,
+   ssaa=1,
+   texture_filter='linear-mipmap-linear').to(device)
 
 
 def dump_video(image_sets, path, **kwargs):
@@ -148,70 +159,64 @@ def save_gaussian(latent, gs_path, model, opacity_thr=None):
     pc = model.gs_renderer.gaussian_model.set_data(xyz.to(torch.float32), features.to(torch.float32), scaling.to(torch.float32), rotation.to(torch.float32), opacity.to(torch.float32))
     pc.save_ply(gs_path)
 
-def fuse_rgbd_to_mesh(cam_dict, colors, depths, out_mesh_fpath, cam_elev_threshold=0):
-    """fuse rgbd into a textured mesh
+def rgbd_to_mesh(images, depths, c2ws, fov, mesh_path, cam_elev_thr=0):
 
-    Args:
-        cam_dict (dict): opencv camera dictionary
-        colors (np.ndarray): [N, H, W, 3]; uint8
-        depths (np.ndarray): [N, H, W]; float32
-        out_mesh_fpath (string): path to obj file
-        cam_elev_threshold (float, optional): _description_. Defaults to 0.
-    """
+    voxel_length = 2 * 2.0 / 512.0
+    sdf_trunc = 2 * 0.02
+    color_type = o3d.pipelines.integration.TSDFVolumeColorType.RGB8
+
     volume = o3d.pipelines.integration.ScalableTSDFVolume(
-        voxel_length=2 * 2.0 / 512.0,
-        sdf_trunc=2 * 0.02,
-        color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
+        voxel_length=voxel_length,
+        sdf_trunc=sdf_trunc,
+        color_type=color_type,
     )
 
-    print("Integrate images into the TSDF volume.")
-    for i in tqdm(range(len(cam_dict["frames"]))):
-        frame = cam_dict["frames"][i]
-
-        w2c = np.array(frame["w2c"])
-        c2w = np.linalg.inv(w2c)
-        cam_pos = c2w[:3, 3]
-        cam_elev = np.rad2deg(np.arcsin(cam_pos[2]))
-        if cam_elev < cam_elev_threshold:
-            # print(f"Camera {i} is below the threshold {cam_elev_threshold}. Skip.")
+    for i in tqdm(range(c2ws.shape[0])):
+        camera_to_world = c2ws[i]
+        world_to_camera = np.linalg.inv(camera_to_world)
+        camera_position = camera_to_world[:3, 3]
+        camera_elevation = np.rad2deg(np.arcsin(camera_position[2]))
+        if camera_elevation < cam_elev_thr:
             continue
-
-        color = o3d.geometry.Image(np.ascontiguousarray(colors[i]))
-        depth = o3d.geometry.Image(np.ascontiguousarray(depths[i]))
-        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-            color, depth, depth_scale=1.0, depth_trunc=4.0, convert_rgb_to_intensity=False
+        color_image = o3d.geometry.Image(np.ascontiguousarray(images[i]))
+        depth_image = o3d.geometry.Image(np.ascontiguousarray(depths[i]))
+        rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(
+            color_image, depth_image, depth_scale=1.0, depth_trunc=4.0, convert_rgb_to_intensity=False
         )
-        cam_intrinsics = o3d.camera.PinholeCameraIntrinsic()
-        cam_intrinsics.set_intrinsics(
-            frame["w"], frame["h"], frame["fx"], frame["fy"], frame["cx"], frame["cy"]
+        camera_intrinsics = o3d.camera.PinholeCameraIntrinsic()
+
+        fx = fy =  images[i].shape[1] / 2. / np.tan(np.deg2rad(fov / 2.0))
+        cx = cy = images[i].shape[1] / 2.
+        h =  images[i].shape[0]
+        w =  images[i].shape[1]
+        camera_intrinsics.set_intrinsics(
+            w, h, fx, fy, cx, cy
         )
         volume.integrate(
-            rgbd,
-            cam_intrinsics,
-            w2c,
+            rgbd_image,
+            camera_intrinsics,
+            world_to_camera,
         )
 
-    print("Extract a triangle mesh from the volume and export it.")
-    mesh = volume.extract_triangle_mesh()
+    fused_mesh = volume.extract_triangle_mesh()
 
-    with o3d.utility.VerbosityContextManager(
-            o3d.utility.VerbosityLevel.Debug) as cm:
-        triangle_clusters, cluster_n_triangles, cluster_area = (
-            mesh.cluster_connected_triangles())
+    triangle_clusters, cluster_n_triangles, cluster_area = (
+            fused_mesh.cluster_connected_triangles())
     triangle_clusters = np.asarray(triangle_clusters)
     cluster_n_triangles = np.asarray(cluster_n_triangles)
     cluster_area = np.asarray(cluster_area)
 
     triangles_to_remove = cluster_n_triangles[triangle_clusters] < 500
-    mesh.remove_triangles_by_mask(triangles_to_remove)
-    mesh.remove_unreferenced_vertices()
+    fused_mesh.remove_triangles_by_mask(triangles_to_remove)
+    fused_mesh.remove_unreferenced_vertices()
 
-    mesh = mesh.filter_smooth_simple(number_of_iterations=2)
-    mesh = mesh.compute_vertex_normals()
-    o3d.io.write_triangle_mesh(out_mesh_fpath, mesh)
+    fused_mesh = fused_mesh.filter_smooth_simple(number_of_iterations=2)
+    fused_mesh = fused_mesh.compute_vertex_normals()
+    o3d.io.write_triangle_mesh(mesh_path, fused_mesh)
+    print(f'Save mesh at {mesh_path}')
 
 
-def images2gaussian(images, c2ws, fxfycxcy, model, gs_path, video_path, mesh_path=None, fuse_mesh=False):
+def images2gaussian(images, c2ws, fxfycxcy, model, gs_path, video_path, mesh_path=None, fuse_mesh=False, optimize_texture=False):
 
     if fuse_mesh:
         fib_camera_path = generate_cameras(r=2.9, num_cameras=200, pitch=np.deg2rad(20), use_fibonacci=True)
@@ -237,7 +242,7 @@ def images2gaussian(images, c2ws, fxfycxcy, model, gs_path, video_path, mesh_pat
                 if gs[key] is not None:
                     gs[key] = gs[key][filter_mask[:, 0], filter_mask[:, 1]].unsqueeze(0)
 
-            save_gaussian(gs, gs_path, model, opacity_thr=None)
+            save_gaussian(gs, gs_path, model, opacity_thr=0.05)
 
             gs_rendering = model.gs_renderer.render(latent=gs,
                 output_c2ws=camera_path.unsqueeze(0),
@@ -245,6 +250,7 @@ def images2gaussian(images, c2ws, fxfycxcy, model, gs_path, video_path, mesh_pat
             dump_video((gs_rendering[0].permute(0,2,3,1).detach().cpu().numpy()*255).astype(np.uint8), video_path) 
 
             if fuse_mesh:
+                print('Start fusing mesh...')
                 c_nerf_results = model.gs_renderer.render(latent=gs,
                         output_c2ws=fib_camera_path.unsqueeze(0),
                         output_fxfycxcy=fxfycxcy[:, 0:1].repeat(1, fib_camera_path.shape[0],1))
@@ -262,23 +268,38 @@ def images2gaussian(images, c2ws, fxfycxcy, model, gs_path, video_path, mesh_pat
                 mask = (weights_sum > 1e-2).astype(np.uint8)
                 depths = depths * mask - np.ones_like(depths) * (1 - mask)
 
+                c2ws = fib_camera_path.detach().cpu().numpy()
+                fov = 50
+                rgbd_to_mesh(images, depths, c2ws, fov, mesh_path)
 
-                cam_dict = {"frames": []}
-                hfov = 50
+    if optimize_texture:
+        print('Start optimizing texture...')
+        num_cameras = 16
+        cam_pos = fib_camera_path[:, :3, 3].cpu().numpy()
+        cam_inds = torch.from_numpy(fpsample.fps_sampling(cam_pos, num_cameras).astype(np.int64)).to(device=device)
 
-                for j in range(images.shape[0]):
-                    frame_dict = {}
-                    fx = images[j].shape[1] / 2. / np.tan(np.deg2rad(hfov / 2.0))
-                    fy = fx
-                    frame_dict["fx"] = fx
-                    frame_dict["fy"] = fy
-                    frame_dict["cx"] = images[j].shape[1] / 2.
-                    frame_dict["cy"] = images[j].shape[0] / 2.
-                    frame_dict["h"] = images[j].shape[0]
-                    frame_dict["w"] = images[j].shape[1]
-                    frame_dict["w2c"] = np.linalg.inv(fib_camera_path[j].detach().cpu().numpy()).tolist()
-                    cam_dict["frames"].append(frame_dict)
-                fuse_rgbd_to_mesh(cam_dict, images, depths, mesh_path)
+        bake_alphas = cnerf_alpha[:, cam_inds].float()
+        bake_images = (cnerf_image[:, cam_inds].float() - (1 - bake_alphas)) / bake_alphas.clamp(min=1e-6)
+
+        out_mesh = Mesh.load(mesh_path, auto_uv=False, device='cpu')
+        mesh_verts_, mesh_faces_ = fast_simplification.simplify(
+            out_mesh.v.numpy(), out_mesh.f.numpy(), target_reduction=0.9)
+        mesh_verts = out_mesh.v.new_tensor(mesh_verts_, dtype=torch.float32).requires_grad_(False)
+        mesh_faces = out_mesh.f.new_tensor(mesh_faces_).requires_grad_(False)
+        out_mesh = Mesh(v=mesh_verts, f=mesh_faces)
+        out_mesh.auto_normal()
+        out_mesh.auto_uv()
+        out_mesh = out_mesh.to(device)
+        intrinsics = fxfycxcy[:, 0:1].clone().float()
+        intrinsics[..., [0, 2]] *= bake_images.shape[-2]
+        intrinsics[..., [1, 3]] *= bake_images.shape[-3]
+        out_mesh = mesh_renderer.bake_multiview(
+            [out_mesh], bake_images, bake_alphas, fib_camera_path.unsqueeze(0)[:, cam_inds].float(), intrinsics
+        )[0]
+        out_mesh.write(mesh_path[:-4] + '_fine.glb', flip_yz=True)
+        print(f"Save optimized mesh at {mesh_path[:-4] + '_fine.glb'}")
+    
+
 
 
 def pad_image_to_fit_fov(image, new_fov, old_fov):
@@ -308,15 +329,16 @@ def instant3d_gs(instant3d_model,
               prompt='a chair',
               guidance_scale=5.0,
               num_steps=30,
-              gaussian_sigma=0.1,
+              gaussian_std=0.1,
               cache_dir='cache',
-              fuse_mesh=False):
+              fuse_mesh=False,
+              optimize_texture=False):
 
     image = instant3d_pipe(model=instant3d_model,
                        prompt=prompt,
                        guidance_scale=guidance_scale,
                        num_steps=num_steps,
-                       gaussian_sigma=gaussian_sigma)
+                       gaussian_std=gaussian_std)
     torch.cuda.empty_cache()
 
     # reshape 2H * 2W * C ---> 4* H * W * C
@@ -338,7 +360,7 @@ def instant3d_gs(instant3d_model,
     fxfycxcy = (fxfycxcy.unsqueeze(0).unsqueeze(0)).repeat(1, c2ws.shape[1], 1)
 
     prompt = '_'.join(prompt.split())
-    images2gaussian(image, c2ws, fxfycxcy, grm_model, f'./{cache_dir}/{prompt}_gs.ply', f'{cache_dir}/{prompt}.mp4', f'{cache_dir}/{prompt}_mesh.ply', fuse_mesh=fuse_mesh)
+    images2gaussian(image, c2ws, fxfycxcy, grm_model, f'./{cache_dir}/{prompt}_gs.ply', f'{cache_dir}/{prompt}.mp4', f'{cache_dir}/{prompt}_mesh.ply', fuse_mesh=fuse_mesh, optimize_texture=optimize_texture)
     torch.cuda.empty_cache()
 
 def zero123plus_v11(
@@ -349,6 +371,7 @@ def zero123plus_v11(
           num_steps=30,
           cache_dir='cache',
           fuse_mesh=False,
+          optimize_texture=False,
           ):
     cond = Image.open(image_path)
     images = zero123_model(cond, num_inference_steps=num_steps).images[0]
@@ -383,7 +406,7 @@ def zero123plus_v11(
     fxfycxcy = (fxfycxcy.unsqueeze(0).unsqueeze(0)).repeat(1, c2ws.shape[1], 1)
 
     name = os.path.splitext(os.path.basename(image_path))[0]
-    images2gaussian(images, c2ws, fxfycxcy, grm_model, f'./{cache_dir}/{name}_gs.ply', f'{cache_dir}/{name}.mp4', f'{cache_dir}/{name}_mesh.ply', fuse_mesh=fuse_mesh)
+    images2gaussian(images, c2ws, fxfycxcy, grm_model, f'./{cache_dir}/{name}_gs.ply', f'{cache_dir}/{name}.mp4', f'{cache_dir}/{name}_mesh.ply', fuse_mesh=fuse_mesh, optimize_texture=optimize_texture)
     torch.cuda.empty_cache()
     
 
@@ -394,7 +417,8 @@ def zero123plus_v12(
           image_path,
           num_steps=30,
           cache_dir='cache',
-          fuse_mesh=False
+          fuse_mesh=False,
+          optimize_texture=False,
           ):
     cond = Image.open(image_path)
     images = zero123_model(cond, num_inference_steps=num_steps).images[0]
@@ -431,18 +455,21 @@ def zero123plus_v12(
     fxfycxcy = (fxfycxcy.unsqueeze(0).unsqueeze(0)).repeat(1, c2ws.shape[1], 1)
 
     name = os.path.splitext(os.path.basename(image_path))[0]
-    images2gaussian(images, c2ws, fxfycxcy, grm_model, f'./{cache_dir}/{name}_gs.ply', f'{cache_dir}/{name}.mp4', f'{cache_dir}/{name}_mesh.ply', fuse_mesh=fuse_mesh)
+    images2gaussian(images, c2ws, fxfycxcy, grm_model, f'./{cache_dir}/{name}_gs.ply', f'{cache_dir}/{name}.mp4', f'{cache_dir}/{name}_mesh.ply', fuse_mesh=fuse_mesh, optimize_texture=optimize_texture)
     torch.cuda.empty_cache()
 
-def sv3d_gs(grm_model,
+def sv3d_gs(
+          sv3d_model,
+          grm_model,
           grm_model_cfg,
           image_path,
           num_steps=30,
           cache_dir='cache',
-          fuse_mesh=False
+          fuse_mesh=False,
+          optimize_texture=False,
           ):
 
-    video = sv3d_pipe(model=None,
+    video = sv3d_pipe(model=sv3d_model,
                 input_path=image_path,
                 version='sv3d_p',
                 elevations_deg=20.0,
@@ -469,7 +496,7 @@ def sv3d_gs(grm_model,
     fxfycxcy = (fxfycxcy.unsqueeze(0).unsqueeze(0)).repeat(1, c2ws.shape[1], 1)
 
     name = os.path.splitext(os.path.basename(image_path))[0]
-    images2gaussian(images, c2ws, fxfycxcy, grm_model, f'./{cache_dir}/{name}_gs.ply', f'{cache_dir}/{name}.mp4', f'{cache_dir}/{name}_mesh.ply', fuse_mesh=fuse_mesh)
+    images2gaussian(images, c2ws, fxfycxcy, grm_model, f'./{cache_dir}/{name}_gs.ply', f'{cache_dir}/{name}.mp4', f'{cache_dir}/{name}_mesh.ply', fuse_mesh=fuse_mesh, optimize_texture=optimize_texture)
     torch.cuda.empty_cache()
 
 def main(args):
@@ -499,19 +526,26 @@ def main(args):
                   prompt=args.prompt,
                   guidance_scale=5.0,
                   num_steps=30,
-                  gaussian_sigma=0.1,
+                  gaussian_std=0.1,
                   cache_dir=args.cache_dir,
-                  fuse_mesh=args.fuse_mesh)
+                  fuse_mesh=args.fuse_mesh,
+                  optimize_texture=args.optimize_texture)
 
     else:
         if args.model == 'sv3d':
+            sv3d_model = build_sv3d_model(
+                             num_steps=30,
+                             device=device,
+                             )
             sv3d_gs(
+                  sv3d_model=sv3d_model,
                   grm_model=grm_uniform_model,
                   grm_model_cfg=grm_uniform_config,
                   image_path=args.image_path,
                   num_steps=30,
                   cache_dir=args.cache_dir,
                   fuse_mesh=args.fuse_mesh,
+                  optimize_texture=args.optimize_texture,
                   )
         elif args.model == 'zero123plus-v1.1':
             zero123 = DiffusionPipeline.from_pretrained(
@@ -531,6 +565,7 @@ def main(args):
               num_steps=30,
               cache_dir=args.cache_dir,
               fuse_mesh=args.fuse_mesh,
+              optimize_texture=args.optimize_texture,
               )
         elif args.model == 'zero123plus-v1.2':
             zero123 = DiffusionPipeline.from_pretrained(
@@ -550,6 +585,7 @@ def main(args):
               num_steps=30,
               cache_dir=args.cache_dir,
               fuse_mesh=args.fuse_mesh,
+              optimize_texture=args.optimize_texture,
               )
         else:
             raise NotImplementedError
@@ -579,6 +615,9 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         "--fuse_mesh", type=bool, default=False, help='Whether to get the mesh.'
+    )
+    parser.add_argument(
+        "--optimize_texture", type=bool, default=False, help='Whether to optimizer texture for the mesh.'
     )
     args = parser.parse_args()
 
